@@ -1,0 +1,17 @@
+[package]
+name = "muspell-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Internal workspace dependency
+# muspell-core is the shared library
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Add iroh-related deps here if core logic lives here
+# iroh = "0.33"
+# iroh-docs = "0.33"
+# iroh-blobs = "0.33"

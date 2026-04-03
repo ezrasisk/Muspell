@@ -1,10 +1,13 @@
-//! Layered configuration via `figment` (TOML file → env vars → CLI overrides).
+//! Layered configuration via `figment`.
 //!
-//! Precedence (highest wins): CLI flags > `MUSPELL_*` env vars > config file
-//! > built-in defaults.
+//! Precedence (highest wins):
+//!   CLI flags > `MUSPELL__<SECTION>__<KEY>` env vars > config file > defaults
+//!
+//! Double-underscore (`__`) is the separator because single-underscore is
+//! common in key names themselves (e.g. `timeout_ms`).
 
 use figment::{
-    providers::{Env, Format, Serialized, Toml},
+    providers::{Env, Serialized, Toml},
     Figment,
 };
 use serde::{Deserialize, Serialize};
@@ -30,19 +33,20 @@ pub struct KnsConfig {
     #[serde(default = "default_kns_timeout_ms")]
     pub timeout_ms: u64,
 
-    /// Maximum number of retry attempts before surfacing an error.
+    /// Maximum total retry attempts across all URLs before giving up.
     #[serde(default = "default_kns_max_retries")]
     pub max_retries: u32,
 
-    /// Initial backoff delay in milliseconds (doubles on each attempt).
+    /// Initial backoff delay (ms); doubles on each attempt.
     #[serde(default = "default_kns_backoff_ms")]
     pub initial_backoff_ms: u64,
 
-    /// Hard cap on backoff delay in milliseconds.
+    /// Hard ceiling on retry delay (ms).
     #[serde(default = "default_kns_max_backoff_ms")]
     pub max_backoff_ms: u64,
 
-    /// Cache TTL for successfully resolved records (seconds).
+    /// In-memory cache TTL for successfully resolved records (seconds).
+    /// Also controls how often the daemon's KNS refresh loop runs.
     #[serde(default = "default_kns_cache_ttl_s")]
     pub cache_ttl_s: u64,
 }
@@ -63,9 +67,9 @@ impl Default for KnsConfig {
     }
 }
 
-fn default_kns_timeout_ms() -> u64 { 5_000 }
+fn default_kns_timeout_ms() -> u64  { 5_000 }
 fn default_kns_max_retries() -> u32 { 5 }
-fn default_kns_backoff_ms() -> u64 { 200 }
+fn default_kns_backoff_ms() -> u64  { 200 }
 fn default_kns_max_backoff_ms() -> u64 { 30_000 }
 fn default_kns_cache_ttl_s() -> u64 { 300 }
 
@@ -75,26 +79,24 @@ fn default_kns_cache_ttl_s() -> u64 { 300 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MirrorConfig {
-    /// Minimum number of live peers required before a blob is considered
-    /// durably mirrored (quorum).
+    /// Minimum peers that must hold a blob for it to be considered durable.
     #[serde(default = "default_quorum")]
     pub quorum: usize,
 
-    /// How often (seconds) the mirror engine re-verifies peer health and
-    /// triggers re-sync for any missing blobs.
+    /// How often (seconds) the engine re-verifies blobs and re-announces
+    /// under-replicated ones.
     #[serde(default = "default_sync_interval_s")]
     pub sync_interval_s: u64,
 
-    /// Maximum number of concurrent blob-push operations.
+    /// Max parallel in-flight gossip broadcast operations.
     #[serde(default = "default_max_concurrent_syncs")]
     pub max_concurrent_syncs: usize,
 
-    /// Maximum blob size (bytes) the engine will mirror automatically.
-    /// Larger blobs require explicit opt-in via the CLI.
+    /// Blobs larger than this (bytes) are skipped by the auto-mirror loop.
     #[serde(default = "default_max_blob_bytes")]
     pub max_blob_bytes: u64,
 
-    /// Local storage path for mirrored blobs.
+    /// Local blob store path.
     #[serde(default = "default_blob_store_path")]
     pub blob_store_path: PathBuf,
 }
@@ -111,11 +113,12 @@ impl Default for MirrorConfig {
     }
 }
 
-fn default_quorum() -> usize { 3 }
-fn default_sync_interval_s() -> u64 { 60 }
+fn default_quorum() -> usize              { 3 }
+fn default_sync_interval_s() -> u64       { 60 }
 fn default_max_concurrent_syncs() -> usize { 8 }
-fn default_max_blob_bytes() -> u64 { 512 * 1024 * 1024 } // 512 MiB
+fn default_max_blob_bytes() -> u64        { 512 * 1024 * 1024 } // 512 MiB
 fn default_blob_store_path() -> PathBuf {
+    // dirs 5.x uses the same function names; no API change needed.
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("muspell")
@@ -128,21 +131,18 @@ fn default_blob_store_path() -> PathBuf {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
-    /// Path to the persistent node secret key file.
+    /// Path to the persistent node secret key file (raw 32 bytes, mode 0600).
     #[serde(default = "default_key_path")]
     pub key_path: PathBuf,
 
-    /// KNS names this node claims to own (validated on startup).
+    /// KNS names this node claims to own. Each is validated against the local
+    /// key on startup, aborting with a clear error on mismatch.
     #[serde(default)]
     pub owned_names: Vec<String>,
 
-    /// Relay server URLs for NAT traversal.
+    /// Relay server URLs. Leave empty to use Iroh's default public relays.
     #[serde(default)]
     pub relay_urls: Vec<Url>,
-
-    /// Bind address for the Iroh node's QUIC listener.
-    #[serde(default = "default_bind_addr")]
-    pub bind_addr: String,
 }
 
 impl Default for NodeConfig {
@@ -151,7 +151,6 @@ impl Default for NodeConfig {
             key_path: default_key_path(),
             owned_names: vec![],
             relay_urls: vec![],
-            bind_addr: default_bind_addr(),
         }
     }
 }
@@ -162,7 +161,6 @@ fn default_key_path() -> PathBuf {
         .join("muspell")
         .join("node.key")
 }
-fn default_bind_addr() -> String { "0.0.0.0:11204".to_string() }
 
 // ── Observability subsection ──────────────────────────────────────────────────
 
@@ -170,15 +168,17 @@ fn default_bind_addr() -> String { "0.0.0.0:11204".to_string() }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObservabilityConfig {
-    /// Log level filter (e.g. "info", "muspell=debug,warn").
+    /// `tracing-subscriber` `EnvFilter` directive.
+    /// Examples: `"info"`, `"muspell=debug,warn"`.
     #[serde(default = "default_log_level")]
     pub log_level: String,
 
-    /// Output format: "pretty" | "json" | "compact".
+    /// Output format: `"pretty"` | `"json"` | `"compact"`.
+    /// Use `"json"` in production for log aggregators.
     #[serde(default = "default_log_format")]
     pub log_format: String,
 
-    /// Bind address for the HTTP health/metrics endpoint.
+    /// Bind address for the Axum health endpoint (`/health`, `/readyz`).
     #[serde(default = "default_health_addr")]
     pub health_addr: String,
 }
@@ -193,13 +193,13 @@ impl Default for ObservabilityConfig {
     }
 }
 
-fn default_log_level() -> String { "info".to_string() }
+fn default_log_level() -> String  { "info".to_string() }
 fn default_log_format() -> String { "pretty".to_string() }
 fn default_health_addr() -> String { "127.0.0.1:9090".to_string() }
 
 // ── Root config ───────────────────────────────────────────────────────────────
 
-/// Root configuration object, composed from all subsections.
+/// Root configuration object.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct MuspellConfig {
@@ -217,13 +217,15 @@ pub struct MuspellConfig {
 }
 
 impl MuspellConfig {
-    /// Load configuration from `path` (TOML), then overlay `MUSPELL_*` env vars.
+    /// Load configuration from `path` (TOML), then overlay `MUSPELL__*` env vars.
     ///
     /// # Errors
     ///
     /// Returns [`MuspellError::Config`] if the TOML is malformed or a required
     /// field is absent after all layers have been applied.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        // Note: `figment::providers::Format` is not imported; `Toml` is its own
+        // type that implements the provider trait directly — no trait import needed.
         Figment::from(Serialized::defaults(MuspellConfig::default()))
             .merge(Toml::file(path.as_ref()))
             .merge(Env::prefixed("MUSPELL_").split("__"))
@@ -231,18 +233,19 @@ impl MuspellConfig {
             .map_err(|e| MuspellError::Config(e.to_string()))
     }
 
-    /// Load from a specific path, falling back to XDG default location.
+    /// Load from the given path, or fall back to the XDG default location.
+    /// In both cases env-var overrides are applied on top.
     pub fn load_or_default(path: Option<impl AsRef<Path>>) -> Result<Self> {
-        let default_path = dirs::config_local_dir()
+        let xdg_default = dirs::config_local_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("muspell")
             .join("config.toml");
 
-        let p = path
+        let resolved = path
             .as_ref()
             .map(|p| p.as_ref().to_path_buf())
-            .unwrap_or(default_path);
+            .unwrap_or(xdg_default);
 
-        Self::load(&p)
+        Self::load(&resolved)
     }
 }

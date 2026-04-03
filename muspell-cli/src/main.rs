@@ -2,15 +2,15 @@
 //!
 //! ## Subcommands
 //!
-//! | Command               | Description                                      |
-//! |-----------------------|--------------------------------------------------|
-//! | `node info`           | Display local node ID and address                |
-//! | `node status`         | Query the daemon health endpoint                 |
-//! | `kns resolve <name>`  | Resolve a KNS name and print the record          |
-//! | `kns verify <name>`   | Resolve + validate ownership proof               |
-//! | `mirror add <hash>`   | Fan out a blob hash to the mirror quorum         |
-//! | `mirror stats`        | Display mirror engine statistics                 |
-//! | `config show`         | Dump the effective configuration as TOML         |
+//! ```text
+//! muspell node info              → local node key path and config
+//! muspell node status            → GET /health from the running daemon
+//! muspell kns resolve <name>     → resolve a KNS name and print the record
+//! muspell kns verify  <name>     → resolve + validate ownership proof
+//! muspell mirror stats           → mirror engine metrics from the daemon
+//! muspell config show            → dump effective merged configuration as TOML
+//! muspell config validate        → parse-only check (no daemon required)
+//! ```
 
 use std::path::PathBuf;
 
@@ -23,13 +23,14 @@ use tracing_subscriber::EnvFilter;
 
 /// Muspell — decentralized discovery and persistence for Iroh nodes.
 #[derive(Debug, Parser)]
-#[command(name = "muspell", version, about, long_about = None, propagate_version = true)]
+#[command(name = "muspell", version, about, propagate_version = true)]
 struct Cli {
-    /// Path to config file (default: $XDG_CONFIG_HOME/muspell/config.toml).
+    /// Path to config file.
+    /// Default: $XDG_CONFIG_HOME/muspell/config.toml
     #[arg(short, long, env = "MUSPELL_CONFIG", global = true, value_name = "FILE")]
     config: Option<PathBuf>,
 
-    /// Muspell daemon health endpoint (for status queries).
+    /// Base URL of the running muspelld health endpoint.
     #[arg(
         long,
         env = "MUSPELL_DAEMON_URL",
@@ -38,7 +39,7 @@ struct Cli {
     )]
     daemon_url: String,
 
-    /// Output format: "pretty" | "json".
+    /// Output format.
     #[arg(long, global = true, default_value = "pretty")]
     output: OutputFormat,
 
@@ -56,24 +57,21 @@ enum OutputFormat {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Local Iroh node management.
+    /// Local Iroh node information.
     Node {
         #[command(subcommand)]
         cmd: NodeCmd,
     },
-
     /// Kaspa Name Service operations.
     Kns {
         #[command(subcommand)]
         cmd: KnsCmd,
     },
-
     /// EigenMead data-mirroring controls.
     Mirror {
         #[command(subcommand)]
         cmd: MirrorCmd,
     },
-
     /// Configuration management.
     Config {
         #[command(subcommand)]
@@ -81,73 +79,67 @@ enum Commands {
     },
 }
 
-// ── Node subcommands ──────────────────────────────────────────────────────────
-
 #[derive(Debug, Subcommand)]
 enum NodeCmd {
-    /// Print the local node ID (public key hex).
+    /// Show the local node key path and identity info.
     Info,
-
     /// Query the running daemon's health endpoint.
     Status,
 }
 
-// ── KNS subcommands ───────────────────────────────────────────────────────────
-
 #[derive(Debug, Subcommand)]
 enum KnsCmd {
-    /// Resolve a KNS name and display the record.
+    /// Resolve a KNS name and display the raw record.
     Resolve {
-        /// The KNS name to resolve (e.g. "alice.kas").
+        /// KNS name to resolve, e.g. "alice.kas".
         name: String,
     },
-
-    /// Resolve a name and cryptographically verify the ownership proof.
+    /// Resolve a KNS name and cryptographically verify the ownership proof.
     Verify {
-        /// The KNS name to verify.
+        /// KNS name to verify.
         name: String,
     },
 }
-
-// ── Mirror subcommands ────────────────────────────────────────────────────────
 
 #[derive(Debug, Subcommand)]
 enum MirrorCmd {
-    /// Fan out a blob (by BLAKE3 hex hash) to the mirror quorum.
-    Add {
-        /// BLAKE3 hash of the blob (64 hex chars).
-        hash: String,
-    },
-
-    /// Display current mirror engine statistics.
+    /// Display mirror engine statistics from the running daemon.
     Stats,
 }
 
-// ── Config subcommands ────────────────────────────────────────────────────────
-
 #[derive(Debug, Subcommand)]
 enum ConfigCmd {
-    /// Dump the effective (merged) configuration.
+    /// Dump the effective (merged) configuration as TOML.
     Show,
-
     /// Validate the config file without starting the daemon.
     Validate,
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
-async fn handle_node(cmd: NodeCmd, daemon_url: &str, output: &OutputFormat) -> Result<()> {
+async fn handle_node(cmd: NodeCmd, config: &MuspellConfig, daemon_url: &str, output: &OutputFormat) -> Result<()> {
     match cmd {
         NodeCmd::Info => {
-            // In a full impl, read the key from config path
-            println!("Local node: (run muspelld to initialise)");
+            match output {
+                OutputFormat::Json => {
+                    let v = serde_json::json!({
+                        "key_path": config.node.key_path.display().to_string(),
+                        "owned_names": config.node.owned_names,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&v)?);
+                }
+                OutputFormat::Pretty => {
+                    println!("Key path     : {}", config.node.key_path.display());
+                    println!("Owned names  : {:?}", config.node.owned_names);
+                    println!("(start muspelld to see the live NodeId)");
+                }
+            }
         }
 
         NodeCmd::Status => {
             let resp = reqwest::get(format!("{daemon_url}/health"))
                 .await
                 .context("daemon unreachable — is muspelld running?")?;
-
             let status = resp.status();
             let body: serde_json::Value = resp.json().await.context("invalid JSON from daemon")?;
 
@@ -158,7 +150,7 @@ async fn handle_node(cmd: NodeCmd, daemon_url: &str, output: &OutputFormat) -> R
                     println!("Node ID       : {}", body["node_id"].as_str().unwrap_or("?"));
                     println!("Uptime (s)    : {}", body["uptime_secs"]);
                     println!("Live peers    : {}", body["mirror"]["live_peers"]);
-                    println!("HTTP code     : {status}");
+                    println!("HTTP status   : {status}");
                 }
             }
         }
@@ -185,7 +177,6 @@ async fn handle_kns(cmd: KnsCmd, config: &MuspellConfig, output: &OutputFormat) 
 
         KnsCmd::Verify { name } => {
             let record = client.resolve(&name).await.context("KNS resolution failed")?;
-
             match OwnershipValidator::verify_ownership_proof(
                 &record.iroh_node_id,
                 &record.ownership_proof,
@@ -206,23 +197,12 @@ async fn handle_kns(cmd: KnsCmd, config: &MuspellConfig, output: &OutputFormat) 
 
 async fn handle_mirror(cmd: MirrorCmd, daemon_url: &str, output: &OutputFormat) -> Result<()> {
     match cmd {
-        MirrorCmd::Add { hash } => {
-            // In a full daemon IPC setup this would POST to an internal endpoint
-            // or use a Unix socket RPC.  For now we print an actionable message.
-            println!("Requesting mirror fanout for blob: {hash}");
-            println!(
-                "→ POST {daemon_url}/mirror/add  (not yet wired; run via muspelld API)"
-            );
-        }
-
         MirrorCmd::Stats => {
             let resp = reqwest::get(format!("{daemon_url}/health"))
                 .await
-                .context("daemon unreachable")?;
-
+                .context("daemon unreachable — is muspelld running?")?;
             let body: serde_json::Value = resp.json().await?;
             let mirror = &body["mirror"];
-
             match output {
                 OutputFormat::Json => println!("{}", serde_json::to_string_pretty(mirror)?),
                 OutputFormat::Pretty => {
@@ -242,8 +222,10 @@ async fn handle_mirror(cmd: MirrorCmd, daemon_url: &str, output: &OutputFormat) 
 async fn handle_config(cmd: ConfigCmd, config: &MuspellConfig) -> Result<()> {
     match cmd {
         ConfigCmd::Show => {
-            let toml = toml::to_string_pretty(config).context("serialization failed")?;
-            println!("{toml}");
+            // `toml` is declared in muspell-cli's Cargo.toml (it was missing originally).
+            let toml_str = toml::to_string_pretty(config)
+                .context("failed to serialise config to TOML")?;
+            print!("{toml_str}");
         }
         ConfigCmd::Validate => {
             println!("✓ Configuration is valid");
@@ -256,7 +238,6 @@ async fn handle_config(cmd: ConfigCmd, config: &MuspellConfig) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Minimal tracing for CLI (errors + explicit debug flag)
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .with_target(false)
@@ -269,8 +250,8 @@ async fn main() -> Result<()> {
         .context("failed to load configuration")?;
 
     match cli.command {
-        Commands::Node { cmd } => handle_node(cmd, &cli.daemon_url, &cli.output).await,
-        Commands::Kns { cmd }  => handle_kns(cmd, &config, &cli.output).await,
+        Commands::Node   { cmd } => handle_node(cmd, &config, &cli.daemon_url, &cli.output).await,
+        Commands::Kns    { cmd } => handle_kns(cmd, &config, &cli.output).await,
         Commands::Mirror { cmd } => handle_mirror(cmd, &cli.daemon_url, &cli.output).await,
         Commands::Config { cmd } => handle_config(cmd, &config).await,
     }

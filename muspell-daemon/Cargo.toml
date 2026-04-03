@@ -1,0 +1,11 @@
+[package]
+name = "muspell-daemon"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+muspell-core = { path = "../muspell-core" }
+tokio = { workspace = true }
+axum = { version = "0.7", features = ["json"] }
+tower-http = { version = "0.5", features = ["cors"] }
+tracing = { workspace = true }

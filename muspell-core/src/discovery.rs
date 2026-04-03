@@ -1,27 +1,35 @@
-//! Iroh `Discovery` provider that resolves node addresses via KNS.
+//! KNS-backed discovery helper for Iroh.
 //!
-//! When Iroh tries to connect to a `NodeId` it doesn't have an address for,
-//! it calls every registered `Discovery` implementation.  `KnsDiscoveryProvider`
-//! fulfils that role by:
+//! ## Pattern (iroh 0.35)
 //!
-//! 1. Looking up the node ID in a reverse-index (node_id → kns_name).
-//! 2. Resolving the KNS name via [`KnsClient`].
-//! 3. Validating the returned record with [`OwnershipValidator`].
-//! 4. Converting relay hints into Iroh `AddrInfo`.
+//! iroh 0.35 provides `iroh::discovery::StaticDiscovery` — a simple in-memory
+//! map from `NodeId` → `NodeAddr` that you populate from any side channel.
+//! When Iroh needs to connect to a `NodeId` it doesn't have an address for,
+//! it calls every registered discovery service; `StaticDiscovery` returns the
+//! most recently stored `NodeAddr` for that id.
 //!
-//! The reverse index is populated out-of-band (e.g. by the daemon) via
-//! [`KnsDiscoveryProvider::register`].
+//! We populate it from KNS:
+//!
+//! ```text
+//! KnsClient::resolve(name)
+//!   → OwnershipValidator::verify_ownership_proof()
+//!   → parse NodeAddr from record
+//!   → StaticDiscovery::add_node_addr()
+//!   → Iroh can now dial the peer
+//! ```
+//!
+//! The builder method in 0.35 is `Endpoint::builder().add_discovery(svc)`.
+//! A single `StaticDiscovery` instance is shared via `Arc` between this
+//! provider and the endpoint builder.
 
 use std::{collections::HashMap, sync::Arc};
 
 use iroh::{
-    discovery::{Discovery, DiscoveryItem},
-    NodeId,
+    discovery::StaticDiscovery,
+    NodeAddr, NodeId, RelayUrl,
 };
 use parking_lot::RwLock;
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 
 use crate::{
     error::{MuspellError, Result},
@@ -29,46 +37,62 @@ use crate::{
     security::OwnershipValidator,
 };
 
-// ── Registration state ────────────────────────────────────────────────────────
+// ── Registry ──────────────────────────────────────────────────────────────────
 
-/// Mapping maintained by the daemon: Iroh NodeId ↔ KNS name.
+/// Bidirectional mapping: KNS name ↔ NodeId (hex).
 #[derive(Debug, Default)]
 struct Registry {
-    /// node_id (hex) → kns_name
+    /// hex(node_id) → kns_name
     by_node_id: HashMap<String, String>,
-    /// kns_name → node_id (hex)
+    /// kns_name → hex(node_id)
     by_name: HashMap<String, String>,
 }
 
 // ── Provider ──────────────────────────────────────────────────────────────────
 
-/// Iroh `Discovery` implementation backed by the Kaspa Name Service.
+/// KNS-backed discovery helper.
+///
+/// Wraps an `Arc<StaticDiscovery>` that must be the **same instance** given to
+/// `Endpoint::builder().add_discovery(Arc::clone(&static_disc))`.  When a name
+/// is resolved and validated, the resulting `NodeAddr` is injected into
+/// `StaticDiscovery` so iroh can dial the peer by `NodeId`.
 pub struct KnsDiscoveryProvider<R: KnsResolver> {
     resolver: Arc<R>,
+    /// Shared with the Iroh endpoint.
+    pub static_discovery: Arc<StaticDiscovery>,
     registry: Arc<RwLock<Registry>>,
 }
 
 impl<R: KnsResolver> KnsDiscoveryProvider<R> {
-    /// Create a new provider wrapping `resolver`.
-    pub fn new(resolver: Arc<R>) -> Self {
+    /// Create a new provider.
+    ///
+    /// `static_discovery` must be the same `Arc<StaticDiscovery>` that is
+    /// (or will be) registered with the `Endpoint` builder via `add_discovery`.
+    pub fn new(resolver: Arc<R>, static_discovery: Arc<StaticDiscovery>) -> Self {
         Self {
             resolver,
+            static_discovery,
             registry: Arc::new(RwLock::new(Registry::default())),
         }
     }
 
-    /// Register a (node_id, kns_name) mapping so that `resolve` can look up
-    /// the right KNS name when Iroh asks for a given `NodeId`.
+    // ── Registration ──────────────────────────────────────────────────────
+
+    /// Associate a `NodeId` (hex) with a KNS name.
+    ///
+    /// This does **not** resolve the name immediately; call
+    /// [`resolve_and_register`] to push actual addressing info to
+    /// `StaticDiscovery`.
     pub fn register(&self, node_id_hex: impl Into<String>, kns_name: impl Into<String>) {
         let node_id = node_id_hex.into();
         let name    = kns_name.into();
         let mut reg = self.registry.write();
         reg.by_name.insert(name.clone(), node_id.clone());
-        reg.by_node_id.insert(node_id, name);
-        info!("registered KNS mapping");
+        reg.by_node_id.insert(node_id.clone(), name.clone());
+        info!(node_id, name, "registered KNS ↔ NodeId mapping");
     }
 
-    /// Remove a mapping (e.g. when a name is transferred to another owner).
+    /// Remove a KNS mapping (e.g. after ownership transfer).
     pub fn deregister(&self, kns_name: &str) {
         let mut reg = self.registry.write();
         if let Some(node_id) = reg.by_name.remove(kns_name) {
@@ -76,122 +100,81 @@ impl<R: KnsResolver> KnsDiscoveryProvider<R> {
         }
     }
 
-    /// Resolve a KNS name and return the validated [`KnsRecord`].
+    // ── Resolution ────────────────────────────────────────────────────────
+
+    /// Resolve `name` via KNS, validate the ownership proof, and inject the
+    /// resulting [`NodeAddr`] into `StaticDiscovery`.
+    ///
+    /// After this returns `Ok`, iroh can connect to the peer by `NodeId`
+    /// without any further intervention.
+    ///
+    /// # Errors
+    ///
+    /// * [`MuspellError::KnsNotFound`] / [`MuspellError::KnsTransport`] on
+    ///   resolution failure.
+    /// * [`MuspellError::InvalidOwnershipProof`] if the signature is bad.
+    /// * [`MuspellError::NodeKeyMismatch`] if the hex is malformed.
     #[instrument(skip(self))]
-    pub async fn resolve_name(&self, name: &str) -> Result<KnsRecord> {
+    pub async fn resolve_and_register(&self, name: &str) -> Result<KnsRecord> {
         let record = self.resolver.resolve(name).await?;
+
+        // Security: validate before trusting any address information.
         OwnershipValidator::verify_ownership_proof(
             &record.iroh_node_id,
             &record.ownership_proof,
         )?;
+
+        let node_id = self.parse_node_id(&record.iroh_node_id)?;
+
+        // Use the first relay hint if present.
+        let relay_url: Option<RelayUrl> = record
+            .relay_hints
+            .first()
+            .and_then(|h| h.parse().ok());
+
+        // In iroh 0.35, NodeAddr { node_id, info: AddrInfo { relay_url,
+        // direct_addresses } } is the correct struct layout.
+        let node_addr = NodeAddr::from_parts(
+            node_id,
+            relay_url,
+            [],  // no direct addresses from KNS records
+        );
+
+        self.static_discovery.add_node_addr(node_addr)
+            .map_err(MuspellError::iroh)?;
+
+        debug!(name, node_id = %record.iroh_node_id, "NodeAddr injected into StaticDiscovery");
         Ok(record)
     }
 
-    /// Internal: given a node ID, find its KNS name and resolve it.
-    async fn resolve_node_id(&self, node_id_hex: &str) -> Result<KnsRecord> {
-        let name = {
+    /// Refresh all registered KNS names. Called by the daemon's periodic loop.
+    pub async fn refresh_all(&self) {
+        let names: Vec<String> = {
             let reg = self.registry.read();
-            reg.by_node_id.get(node_id_hex).cloned()
+            reg.by_name.keys().cloned().collect()
         };
 
-        let name = name.ok_or_else(|| MuspellError::KnsNotFound {
-            name: node_id_hex.to_string(),
-            attempts: 0,
+        for name in names {
+            match self.resolve_and_register(&name).await {
+                Ok(_)  => debug!(name, "KNS record refreshed"),
+                Err(e) => warn!(name, error = %e, "KNS refresh failed"),
+            }
+        }
+    }
+
+    // ── Private ───────────────────────────────────────────────────────────
+
+    fn parse_node_id(&self, hex_str: &str) -> Result<NodeId> {
+        let bytes = hex::decode(hex_str).map_err(|_| MuspellError::NodeKeyMismatch {
+            kns_owner: hex_str.to_string(),
+            presented: "(hex decode failed)".to_string(),
         })?;
 
-        self.resolve_name(&name).await
-    }
+        let arr: [u8; 32] = bytes.try_into().map_err(|_| MuspellError::NodeKeyMismatch {
+            kns_owner: hex_str.to_string(),
+            presented: "expected 32 bytes for NodeId".to_string(),
+        })?;
 
-    /// Convert a [`KnsRecord`]'s relay hints into Iroh [`DiscoveryItem`]s.
-    fn record_to_discovery_items(record: &KnsRecord) -> Vec<DiscoveryItem> {
-        record
-            .relay_hints
-            .iter()
-            .filter_map(|hint| {
-                hint.parse::<iroh::RelayUrl>()
-                    .ok()
-                    .map(|relay_url| {
-                        let node_id = record
-                            .iroh_node_id
-                            .parse::<NodeId>()
-                            .expect("validated before this call");
-
-                        DiscoveryItem {
-                            node_id,
-                            provenance: "kns",
-                            last_updated: None,
-                            addr_info: iroh::NodeAddr {
-                                node_id,
-                                relay_url: Some(relay_url),
-                                direct_addresses: Default::default(),
-                            },
-                        }
-                    })
-            })
-            .collect()
-    }
-}
-
-// ── Iroh Discovery trait implementation ───────────────────────────────────────
-
-impl<R: KnsResolver + 'static> Discovery for KnsDiscoveryProvider<R> {
-    fn resolve(
-        &self,
-        _endpoint: iroh::Endpoint,
-        node_id: NodeId,
-    ) -> Option<iroh::discovery::BoxedFuture<iroh::discovery::BoxedStream<DiscoveryItem>>> {
-        let node_id_hex = hex::encode(node_id.as_bytes());
-        let resolver    = Arc::clone(&self.resolver);
-        let registry    = Arc::clone(&self.registry);
-
-        let fut = async move {
-            let name = {
-                let reg = registry.read();
-                reg.by_node_id.get(&node_id_hex).cloned()
-            };
-
-            let name = match name {
-                Some(n) => n,
-                None => {
-                    debug!(node_id = %node_id_hex, "no KNS mapping, skipping");
-                    // Return an empty stream rather than an error
-                    let (tx, rx) = mpsc::channel::<DiscoveryItem>(1);
-                    drop(tx);
-                    return Box::pin(ReceiverStream::new(rx))
-                        as iroh::discovery::BoxedStream<DiscoveryItem>;
-                }
-            };
-
-            match resolver.resolve(&name).await {
-                Ok(record) => {
-                    // Security: validate the proof before handing addresses to Iroh
-                    if let Err(e) = OwnershipValidator::verify_ownership_proof(
-                        &record.iroh_node_id,
-                        &record.ownership_proof,
-                    ) {
-                        error!(name = %name, error = %e, "ownership proof failed, dropping record");
-                        let (tx, rx) = mpsc::channel::<DiscoveryItem>(1);
-                        drop(tx);
-                        return Box::pin(ReceiverStream::new(rx))
-                            as iroh::discovery::BoxedStream<DiscoveryItem>;
-                    }
-
-                    let items = Self::record_to_discovery_items(&record);
-                    let (tx, rx) = mpsc::channel::<DiscoveryItem>(items.len().max(1));
-                    for item in items {
-                        let _ = tx.send(item).await;
-                    }
-                    Box::pin(ReceiverStream::new(rx)) as iroh::discovery::BoxedStream<DiscoveryItem>
-                }
-                Err(e) => {
-                    warn!(name = %name, error = %e, "KNS resolution failed");
-                    let (tx, rx) = mpsc::channel::<DiscoveryItem>(1);
-                    drop(tx);
-                    Box::pin(ReceiverStream::new(rx)) as iroh::discovery::BoxedStream<DiscoveryItem>
-                }
-            }
-        };
-
-        Some(Box::pin(fut))
+        NodeId::from_bytes(&arr).map_err(MuspellError::iroh)
     }
 }
